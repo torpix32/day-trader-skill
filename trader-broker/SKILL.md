@@ -39,6 +39,8 @@ python3 "${CLAUDE_SKILL_DIR}/ticket.py" result --index 1 --status placed --broke
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" fill --symbol TSLA --side sell --qty 8 --price 370.04
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" flatten --symbol TSLA --qty 8
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" log
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" kill-switch              # on or off today, and why
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" kill-switch --trip --why "tilt"
 ```
 
 `ticket.py` never talks to a broker. It renders tickets, checks that a reply
@@ -54,6 +56,44 @@ is a real yes for that order, builds the flatten ticket, and keeps the log in
 | `trader/state/broker.json` | every yes, no, placed, failed and filled, with each entry's max loss |
 | `trader/portfolio.json` | cash and shares, updated by `fill` and by `result --filled-qty` |
 | `trader/plan.json` | the flat-by time for `flatten` |
+| `trader/trade_log.csv` | one row per closed trade, written by `fill` and `result --filled-qty` on a sell |
+| `trader/watchlist.json` | the scanner's RSI 14, kept on a buy when `--rsi` is not given |
+
+## The trade log
+
+Every sell fill that closes shares adds one row to `trader/trade_log.csv`:
+
+| column | what |
+| --- | --- |
+| `date` | the New York day of the sell |
+| `symbol`, `qty` | what was sold |
+| `entry_price` | the cost of the shares sold, per share (oldest lots first) |
+| `exit_price` | the sell fill price |
+| `pnl_usd` | (exit - entry) x qty, before fees |
+| `rsi` | the RSI kept on the buy: `--rsi` on the buy fill, else the scanner's daily RSI 14 for it in `trader/watchlist.json`, else blank |
+| `entry_date` | the New York day of the buy |
+
+Pass `--rsi` on the buy (`fill --side buy ... --rsi 61.3` or `result ...
+--filled-price P --rsi 61.3`) for the RSI at the moment of entry: the
+scanner's is the daily RSI as of the last close. Hand the file back to Claude
+to analyze the trades.
+
+## The kill switch
+
+The kill switch turns on by itself, for the rest of the New York day, when:
+
+- the trades closed today lost `kill_switch_daily_loss_usd` (default **$10**)
+  or more in all, or
+- the last `kill_switch_losses_in_a_row` (default **3**) trades closed today
+  were all losses (a win starts the count over).
+
+`ticket.py kill-switch --trip` turns it on by hand. While it is on, no new
+entry is READY and `approve` refuses it, even after a PASS from trader-risk.
+An exit (a sell that only closes what you hold) still goes through: getting
+out is never blocked. It cannot be turned off by hand: it ends at the next
+New York day. It counts closed trades only, from the trade log, so every
+fill must be recorded (`fill`, or `result --filled-qty`). An open position's
+loss is not in it until the position is closed.
 
 ## Setup A: Alpaca (official MCP server, Claude Desktop)
 
@@ -158,7 +198,9 @@ that draft orders to Needs approval too.
 - trader-alerts watches the stop, the target and the flat-by time
   (`alerts.py add --from-plan`). The bracket's own orders do the stopping.
 - When the stop-loss or the take-profit fills, record it:
-  `ticket.py fill --symbol TSLA --side sell --qty 8 --price 358.32`.
+  `ticket.py fill --symbol TSLA --side sell --qty 8 --price 358.32`. That
+  writes the row in `trader/trade_log.csv` and can turn the kill switch on:
+  say so to the user when it does.
 - By `flat_by` (15:55 New York), anything still open gets closed:
   1. Ask Alpaca how many shares are held: `get_open_position` (read only).
   2. `ticket.py flatten --symbol TSLA --qty 8` writes a market sell for those

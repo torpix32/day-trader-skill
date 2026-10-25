@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import os
@@ -114,9 +115,102 @@ class Flow(unittest.TestCase):
         self.state = os.path.join(self.d, "state", "broker.json")
         self.pf = os.path.join(self.d, "portfolio.json")
         self.none = os.path.join(self.d, "none")
+        self.log = os.path.join(self.d, "trader", "trade_log.csv")
+        self.cwd = os.getcwd()
+        os.chdir(self.d)                   # the trader/ defaults (trade log, watchlist) land in the temp folder
 
     def tearDown(self):
+        os.chdir(self.cwd)
         shutil.rmtree(self.d)
+
+    def trades(self):
+        with open(self.log, newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def fill(self, sym, side, qty, price, *extra, now=NOW):
+        return run(["fill", "--symbol", sym, "--side", side, "--qty", str(qty), "--price", str(price),
+                    "--now", now, "--portfolio", self.pf, "--config", self.cfg, "--state", self.state] + list(extra))
+
+    def lose(self, n, each, now=NOW):
+        """n closed KO trades losing `each` dollars apiece (1 share in at 90, out at 90 - each)."""
+        for _ in range(n):
+            self.fill("KO", "buy", 1, 90, now=now)
+            self.fill("KO", "sell", 1, 90 - each, now=now)
+
+    def test_a_closed_trade_is_one_row_of_the_trade_log(self):
+        os.makedirs("trader")
+        with open(os.path.join("trader", "watchlist.json"), "w") as fh:
+            json.dump({"mode": "daily", "hits": [{"symbol": "KO", "rsi": 28.44}]}, fh)
+        self.fill("TSLA", "buy", 8, 364.20, "--rsi", "61.27")
+        self.fill("KO", "buy", 2, 90)
+        code, text, _ = self.fill("TSLA", "sell", 8, 358.32)
+        self.assertEqual(code, 0)
+        self.assertIn("in 364.20, out 358.32, -$47.04", text)
+        self.fill("KO", "sell", 2, 91.5)
+        rows = self.trades()
+        self.assertEqual(list(rows[0]), list(ticket.TRADE_LOG_FIELDS))
+        self.assertEqual([(r["symbol"], r["qty"], r["entry_price"], r["exit_price"], r["pnl_usd"], r["rsi"])
+                          for r in rows],
+                         [("TSLA", "8", "364.2000", "358.3200", "-47.04", "61.3"),
+                          ("KO", "2", "90.0000", "91.5000", "3.00", "28.4")])
+        self.assertEqual((rows[0]["date"], rows[0]["entry_date"]), (TODAY, TODAY))
+        self.assertEqual(self.fill("KO", "buy", 1, 90, "--rsi", "101")[0], 1)
+
+    def test_the_kill_switch_trips_at_10_dollars_lost_today(self):
+        self.lose(1, 6)
+        self.assertEqual(run(["kill-switch", "--config", self.cfg, "--state", self.state, "--now", NOW])[0], 0)
+        self.fill("KO", "buy", 1, 90)
+        code, text, _ = self.fill("KO", "sell", 1, 86)
+        self.assertIn("KILL SWITCH ON: the closed trades lost $10 today, the limit is $10", text)
+        code, text, _ = run(["kill-switch", "--config", self.cfg, "--state", self.state, "--now", NOW])
+        self.assertEqual(code, 1)
+        self.assertIn("Kill switch ON on 2026-10-19: closed trades today -$10", text)
+        # no new entry is ready or can be approved, even after a PASS from trader-risk
+        self.assertEqual(self.run_risk(), 0)
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertEqual(code, 1)
+        self.assertIn("KILL SWITCH ON", text)
+        code, _, err = run(self.args("approve", "--index", "1", "--reply", "yes"))
+        self.assertEqual(code, 1)
+        self.assertIn("KILL SWITCH ON", err)
+        # the next New York day starts clean
+        tomorrow = "2026-10-20 10:15"
+        self.assertEqual(run(["kill-switch", "--config", self.cfg, "--state", self.state, "--now", tomorrow])[0], 0)
+
+    def test_three_losses_in_a_row_trip_it_and_a_win_resets_the_count(self):
+        self.lose(2, 1)
+        self.fill("KO", "buy", 1, 90)
+        self.fill("KO", "sell", 1, 92)                 # a win: the streak starts over
+        self.lose(2, 1)
+        self.assertEqual(run(["kill-switch", "--config", self.cfg, "--state", self.state, "--now", NOW])[0], 0)
+        self.fill("KO", "buy", 1, 90)
+        code, text, _ = self.fill("KO", "sell", 1, 89)
+        self.assertIn("the last 3 closed trades today were losses", text)
+
+    def test_an_exit_still_goes_through_and_a_trip_by_hand(self):
+        code, text, _ = run(["kill-switch", "--trip", "--why", "tilt", "--config", self.cfg, "--state", self.state,
+                             "--now", NOW])
+        self.assertEqual(code, 1)
+        self.assertIn("tripped by hand at 2026-10-19T10:15:00-04:00: tilt", text)
+        run(["flatten", "--symbol", "TSLA", "--qty", "8", "--orders", self.orders, "--portfolio", self.none,
+             "--plan", self.none, "--config", self.cfg, "--now", NOW])
+        with open(self.pf, "w") as fh:
+            json.dump({"cash": 2086.4, "positions": [{"ticker": "TSLA", "shares": 8, "lots": [
+                {"id": "TSLA-1", "date": TODAY, "shares": 8, "cost": 2913.6}]}]}, fh)
+        self.assertEqual(self.run_risk(), 0)
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertEqual(code, 0)
+        self.assertIn("READY", text)
+        self.assertEqual(run(self.args("approve", "--index", "1", "--reply", "yes sell 8 TSLA"))[0], 0)
+
+    def test_a_lower_limit_from_the_config(self):
+        with open(self.cfg) as fh:
+            c = json.load(fh)
+        c["kill_switch_daily_loss_usd"] = 3
+        with open(self.cfg, "w") as fh:
+            json.dump(c, fh)
+        self.lose(1, 3)
+        self.assertEqual(run(["kill-switch", "--config", self.cfg, "--state", self.state, "--now", NOW])[0], 1)
 
     def args(self, *extra, **kw):
         return list(extra) + ["--orders", self.orders, "--config", self.cfg, "--risk", self.risk,

@@ -16,10 +16,18 @@ work around the one moment that matters, your yes:
   decline   records a no.
   result    records what happened after the Allow once / Deny card:
             placed (with the broker's order id), denied, or failed.
-  fill      records a fill in trader/portfolio.json (cash and shares).
+  fill      records a fill in trader/portfolio.json (cash and shares). A sell
+            that closes shares adds one row to trader/trade_log.csv (date,
+            symbol, qty, entry price, exit price, profit or loss, RSI).
   flatten   builds a sell ticket that closes a symbol's open position by
             flat_by. It still goes through trader-risk and your yes.
   log       prints today's decisions.
+  kill-switch  says whether the kill switch is on today, or trips it by hand
+            (--trip). It trips by itself when the day's closed trades lose
+            kill_switch_daily_loss_usd (10) or more, or when the last
+            kill_switch_losses_in_a_row (3) closed trades today all lost.
+            Then no new entry is READY until the next New York day. An exit
+            (a sell that only closes what you hold) is never blocked.
 
     python3 ticket.py show                    # every order, READY or not
     python3 ticket.py show --index 1 --json   # one ticket as JSON
@@ -28,12 +36,14 @@ work around the one moment that matters, your yes:
     python3 ticket.py fill --symbol TSLA --side buy --qty 8 --price 364.20
     python3 ticket.py flatten --symbol TSLA --qty 8
     python3 ticket.py log
+    python3 ticket.py kill-switch             # on or off today, and why
 
 Everything is written to trader/state/broker.json (append only). Dates are
 New York dates; --now "2026-10-19 10:15" pins the clock.
 """
 
 import argparse
+import csv
 import datetime
 import hashlib
 import json
@@ -51,6 +61,8 @@ TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at t
              "cls": "at the close", "ioc": "immediate or cancel", "fok": "fill or kill"}
 YES_WORDS = ("yes", "y")
 BATCH_WORDS = {"all", "every", "everything", "rest", "remaining", "them", "both", "batch", "each"}
+TRADE_LOG_FIELDS = ("date", "symbol", "qty", "entry_price", "exit_price", "pnl_usd", "rsi", "entry_date")
+KILL_DEFAULTS = {"kill_switch_daily_loss_usd": 10, "kill_switch_losses_in_a_row": 3}
 DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "maybe", "later",
                "hold", "unless", "if"}
 
@@ -323,14 +335,16 @@ def risk_verdict(risk, fp, today):
     return None, "this exact order was not in the last risk check (it changed or is new); run check.py again"
 
 
-def status_of(order, risk, state, today):
-    """(ready, label, risk_result)"""
+def status_of(order, risk, state, today, kill=None):
+    """(ready, label, risk_result). kill is kill_switch()'s answer: when it is on, no entry is ready."""
     fp = fingerprint(order)
     rv, why = risk_verdict(risk, fp, today)
     if rv is None:
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
         return False, "BLOCKED by trader-risk: " + "; ".join(rv.get("reasons", [])), rv
+    if kill and kill["on"] and kind_of(order, rv) == "entry":
+        return False, "KILL SWITCH ON: " + "; ".join(kill["reasons"]) + ". No new entry until tomorrow", rv
     rec = latest(state, fp, today)
     if rec:
         st = rec.get("status")
@@ -349,8 +363,8 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+def render(order, idx, total, cfg, risk, state, today, kill=None):
+    ready, label, rv = status_of(order, risk, state, today, kill)
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
@@ -379,8 +393,8 @@ def render(order, idx, total, cfg, risk, state, today):
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+def ticket_json(order, idx, cfg, risk, state, today, kill=None):
+    ready, label, rv = status_of(order, risk, state, today, kill)
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
@@ -391,9 +405,11 @@ def ticket_json(order, idx, cfg, risk, state, today):
 
 # ---------------------------------------------------------------- fills -> portfolio
 
-def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
+def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date, rsi=None):
     """Record a filled order in trader/portfolio.json: cash and shares, with a
-    cost-basis lot per buy (oldest lots are relieved first on a sell)."""
+    cost-basis lot per buy (oldest lots are relieved first on a sell). A buy
+    keeps its RSI on the lot. Returns (portfolio, closed): closed is None for
+    a buy, else the trade the sell closed (entry from the lots it relieved)."""
     pf = read_json(portfolio_path, "portfolio", required=False)
     if pf is None:
         budget = cfg.get("budget")
@@ -414,14 +430,18 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
             pos = {"ticker": symbol, "shares": 0.0, "lots": []}
             pf["positions"].append(pos)
         lots = pos.setdefault("lots", [])
-        lots.append({"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost})
+        lot = {"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost}
+        if rsi is not None:
+            lot["rsi"] = round(float(rsi), 1)
+        lots.append(lot)
         pos["shares"] = round(float(pos.get("shares", 0)) + qty, 6)
         pf["cash"] = round(float(pf.get("cash", 0)) - cost, 2)
+        closed = None
     else:
         if pos is None or float(pos.get("shares", 0)) + 1e-9 < qty:
             raise TicketError("cannot record selling %s %s: the portfolio holds %s"
                               % (_str_num(qty), symbol, pos.get("shares", 0) if pos else 0))
-        left = qty
+        left, basis, first = qty, 0.0, None
         for lot in sorted(pos.get("lots", []), key=lambda l: l.get("date", "")):
             if left <= 1e-9:
                 break
@@ -429,13 +449,108 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
             per = float(lot["cost"]) / float(lot["shares"]) if float(lot["shares"]) else 0
             lot["cost"] = round(float(lot["cost"]) - per * take, 2)
             lot["shares"] = round(float(lot["shares"]) - take, 6)
+            basis += per * take
+            first = first or lot
             left -= take
+        if left > 1e-9:                    # shares held without lots: no entry price to log
+            closed = None
+        else:
+            closed = {"date": date, "symbol": symbol, "qty": _str_num(qty),
+                      "entry_price": "%.4f" % (basis / qty), "exit_price": "%.4f" % price,
+                      "pnl_usd": "%.2f" % (cost - basis),
+                      "rsi": "" if (first or {}).get("rsi") is None else "%.1f" % first["rsi"],
+                      "entry_date": (first or {}).get("date", "")}
         pos["lots"] = [l for l in pos.get("lots", []) if float(l["shares"]) > 1e-9]
         pos["shares"] = round(float(pos["shares"]) - qty, 6)
         if pos["shares"] <= 1e-9:
             pf["positions"].remove(pos)
         pf["cash"] = round(float(pf.get("cash", 0)) + cost, 2)
     write_json(portfolio_path, pf)
+    return pf, closed
+
+
+# ---------------------------------------------------------------- trade log and kill switch
+
+def append_trade(log_path, closed):
+    """One closed trade -> one row of trader/trade_log.csv (the header on the first row)."""
+    d = os.path.dirname(log_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    new = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+    with open(log_path, "a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=TRADE_LOG_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow({k: closed.get(k, "") for k in TRADE_LOG_FIELDS})
+
+
+def read_trades(log_path):
+    if not log_path or not os.path.exists(log_path):
+        return []
+    with open(log_path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def kill_switch(cfg, state, trades, today):
+    """{"on", "reasons", "loss_today", "losses_in_a_row"} from today's closed trades and any manual trip."""
+    c = dict(KILL_DEFAULTS)
+    c.update({k: cfg[k] for k in KILL_DEFAULTS if cfg.get(k) is not None})
+    pnl = [_f(t.get("pnl_usd")) or 0.0 for t in trades if t.get("date") == today]
+    loss = round(-sum(pnl), 2)
+    streak = 0
+    for x in reversed(pnl):
+        if x >= 0:
+            break
+        streak += 1
+    reasons = []
+    cap = _f(c["kill_switch_daily_loss_usd"])
+    if cap and loss >= cap - 1e-9:
+        reasons.append("the closed trades lost %s today, the limit is %s" % (_money(loss), _money(cap)))
+    n = int(c["kill_switch_losses_in_a_row"] or 0)
+    if n and streak >= n:
+        reasons.append("the last %d closed trades today were losses, the limit is %d in a row" % (streak, n))
+    for rec in state.get("kill_switch", []):
+        if rec.get("date") == today:
+            reasons.append("tripped by hand at %s%s" % (rec.get("at"), (": " + rec["why"]) if rec.get("why") else ""))
+    return {"on": bool(reasons), "reasons": reasons, "loss_today": loss, "losses_in_a_row": streak}
+
+
+def lot_rsi(rsi, watchlist_path, symbol):
+    """The RSI to keep on a buy: --rsi, else the scanner's RSI 14 for it in trader/watchlist.json."""
+    if rsi is not None:
+        v = _f(rsi)
+        if v is None or not 0 <= v <= 100:
+            raise TicketError("--rsi wants a number from 0 to 100, got %r" % rsi)
+        return v
+    wl = read_json(watchlist_path, "watchlist", required=False) or {}
+    for h in wl.get("hits", []) if isinstance(wl, dict) else []:
+        if str(h.get("symbol", "")).upper() == symbol.upper() and _f(h.get("rsi")) is not None:
+            return _f(h["rsi"])
+    return None
+
+
+def record_fill(a, cfg, now, date, symbol, side, qty, price):
+    """portfolio + broker log + trade log for one fill; prints the kill switch if this sell tripped it."""
+    rsi = lot_rsi(getattr(a, "rsi", None), a.watchlist, symbol) if side == "buy" else None
+    pf, closed = apply_fill(a.portfolio, cfg, symbol, side, qty, price, date, rsi)
+    log_fill(a.state, now, date, symbol, side, qty, price)
+    if closed:
+        before = kill_switch(cfg, load_state(a.state), read_trades(a.trade_log), date)
+        append_trade(a.trade_log, closed)
+        print("Logged the closed trade in %s: %s %s, in %s, out %s, %s%s." % (
+            a.trade_log, closed["qty"], closed["symbol"], _p(float(closed["entry_price"])),
+            _p(float(closed["exit_price"])), "+" if float(closed["pnl_usd"]) >= 0 else "-",
+            _money(abs(float(closed["pnl_usd"])))))
+        after = kill_switch(cfg, load_state(a.state), read_trades(a.trade_log), date)
+        if after["on"] and not before["on"]:
+            st = load_state(a.state)
+            st.setdefault("orders", []).append({"at": ny_iso(now), "date": date, "status": "kill_switch",
+                                                "plain": "KILL SWITCH ON: " + "; ".join(after["reasons"])})
+            write_json(a.state, st)
+            print("KILL SWITCH ON: %s. No new entry until tomorrow; exits still go through."
+                  % "; ".join(after["reasons"]))
+    elif side == "sell":
+        print("No row in %s: the shares sold have no recorded buy (no entry price)." % a.trade_log)
     return pf
 
 
@@ -468,7 +583,8 @@ def _load(a):
     risk = read_json(a.risk, "risk check", required=False)
     state = load_state(a.state)
     now, today = _clock(a)
-    return orders, cfg, risk, state, today, now
+    kill = kill_switch(cfg, state, read_trades(a.trade_log), today)
+    return orders, cfg, risk, state, today, now, kill
 
 
 def _pick(orders, index):
@@ -480,15 +596,18 @@ def _pick(orders, index):
 
 
 def cmd_show(a):
-    orders, cfg, risk, state, today, now = _load(a)
+    orders, cfg, risk, state, today, now, kill = _load(a)
     picks = [(a.index, _pick(orders, a.index))] if a.index else list(enumerate(orders, 1))
     if a.json:
-        out = [ticket_json(o, i, cfg, risk, state, today) for i, o in picks]
+        out = [ticket_json(o, i, cfg, risk, state, today, kill) for i, o in picks]
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
+    if kill["on"]:
+        print("KILL SWITCH ON: %s. No new entry until tomorrow; exits still go through.\n"
+              % "; ".join(kill["reasons"]))
     for i, o in picks:
-        text, ready = render(o, i, len(orders), cfg, risk, state, today)
+        text, ready = render(o, i, len(orders), cfg, risk, state, today, kill)
         blocks.append(text)
         any_ready = any_ready or ready
     print("\n\n".join(blocks))
@@ -498,9 +617,9 @@ def cmd_show(a):
 
 
 def cmd_approve(a):
-    orders, cfg, risk, state, today, now = _load(a)
+    orders, cfg, risk, state, today, now, kill = _load(a)
     order = _pick(orders, a.index)
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, kill)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
@@ -527,7 +646,7 @@ def cmd_approve(a):
 
 
 def cmd_decline(a):
-    orders, cfg, risk, state, today, now = _load(a)
+    orders, cfg, risk, state, today, now, kill = _load(a)
     order = _pick(orders, a.index)
     rec = {"at": ny_iso(now), "date": today, "index": a.index, "fingerprint": fingerprint(order),
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
@@ -539,7 +658,7 @@ def cmd_decline(a):
 
 
 def cmd_result(a):
-    orders, cfg, risk, state, today, now = _load(a)
+    orders, cfg, risk, state, today, now, kill = _load(a)
     order = _pick(orders, a.index)
     fp = fingerprint(order)
     rec = latest(state, fp, today)
@@ -558,8 +677,7 @@ def cmd_result(a):
     write_json(a.state, state)
     print("Recorded order %d as %s." % (a.index, a.status))
     if a.status == "placed" and a.filled_qty and a.filled_price:
-        apply_fill(a.portfolio, cfg, rec["symbol"], rec["side"], a.filled_qty, a.filled_price, today)
-        log_fill(a.state, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price)
+        record_fill(a, cfg, now, today, rec["symbol"], rec["side"], a.filled_qty, a.filled_price)
         print("Added the fill to %s." % a.portfolio)
     elif a.status == "placed":
         print("When it fills, record it: ticket.py fill --symbol %s --side %s --qty Q --price P"
@@ -575,8 +693,7 @@ def cmd_fill(a):
     date = a.date or to_eastern(now).date().isoformat()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         raise TicketError("--date wants a date like 2026-10-19")
-    pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date)
-    log_fill(a.state, now, date, a.symbol, a.side, a.qty, a.price)
+    pf = record_fill(a, cfg, now, date, a.symbol, a.side, a.qty, a.price)
     print("Recorded %s %s %s at %s on %s in %s. Cash now %s." % (a.side, a.qty, a.symbol.upper(),
                                                                 _money(a.price), date, a.portfolio,
                                                                 _money(pf["cash"])))
@@ -646,6 +763,30 @@ def cmd_log(a):
     return 0
 
 
+def cmd_kill_switch(a):
+    cfg = read_json(a.config, "config", required=False) or {}
+    now, today = _clock(a)
+    state = load_state(a.state)
+    if a.trip:
+        state.setdefault("kill_switch", []).append({"at": ny_iso(now), "date": today, "why": a.why or ""})
+        state.setdefault("orders", []).append({"at": ny_iso(now), "date": today, "status": "kill_switch",
+                                               "plain": "KILL SWITCH ON by hand" + (": " + a.why if a.why else "")})
+        write_json(a.state, state)
+    kill = kill_switch(cfg, state, read_trades(a.trade_log), today)
+    c = dict(KILL_DEFAULTS)
+    c.update({k: cfg[k] for k in KILL_DEFAULTS if cfg.get(k) is not None})
+    print("Kill switch %s on %s: closed trades today %s (limit %s), %d loss%s in a row (limit %s)." % (
+        "ON" if kill["on"] else "off", today,
+        ("-" if kill["loss_today"] > 0 else "+") + _money(abs(kill["loss_today"])),
+        _money(_f(c["kill_switch_daily_loss_usd"]) or 0), kill["losses_in_a_row"],
+        "" if kill["losses_in_a_row"] == 1 else "es", c["kill_switch_losses_in_a_row"]))
+    for r in kill["reasons"]:
+        print("  " + r)
+    if kill["on"]:
+        print("No new entry is READY until the next New York day. Exits still go through.")
+    return 1 if kill["on"] else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Order tickets and your yes (trader-broker). Never places orders.")
     sub = ap.add_subparsers(dest="cmd")
@@ -659,7 +800,12 @@ def main(argv=None):
         p.add_argument("--config", default="trader/config.json")
         p.add_argument("--risk", default="trader/state/risk.json")
         p.add_argument("--state", default="trader/state/broker.json")
+        p.add_argument("--trade-log", default="trader/trade_log.csv")
         clock(p)
+
+    def fills(p):
+        p.add_argument("--rsi", help="RSI at entry, kept on a buy (default: its RSI in trader/watchlist.json)")
+        p.add_argument("--watchlist", default="trader/watchlist.json")
 
     p = sub.add_parser("show", help="render the tickets")
     common(p)
@@ -682,6 +828,7 @@ def main(argv=None):
     p.add_argument("--filled-qty")
     p.add_argument("--filled-price")
     p.add_argument("--portfolio", default="trader/portfolio.json")
+    fills(p)
     p = sub.add_parser("fill", help="record a fill in trader/portfolio.json")
     p.add_argument("--symbol", required=True)
     p.add_argument("--side", required=True, choices=["buy", "sell"])
@@ -692,6 +839,8 @@ def main(argv=None):
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--state", default="trader/state/broker.json")
+    p.add_argument("--trade-log", default="trader/trade_log.csv")
+    fills(p)
     p = sub.add_parser("flatten", help="a sell ticket that closes a symbol's position by flat_by")
     p.add_argument("--symbol", required=True)
     p.add_argument("--qty", help="shares you hold, from get_open_position (default: trader/portfolio.json)")
@@ -704,13 +853,21 @@ def main(argv=None):
     p.add_argument("--state", default="trader/state/broker.json")
     clock(p)
     p.add_argument("--all", action="store_true")
+    p = sub.add_parser("kill-switch", help="on or off today; --trip turns it on until tomorrow")
+    p.add_argument("--trip", action="store_true", help="turn it on by hand for the rest of the day")
+    p.add_argument("--why")
+    p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--state", default="trader/state/broker.json")
+    p.add_argument("--trade-log", default="trader/trade_log.csv")
+    clock(p)
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
         return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
-                "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
+                "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log,
+                "kill-switch": cmd_kill_switch}[a.cmd](a)
     except TicketError as e:
         print("ticket.py: %s" % e, file=sys.stderr)
         return 1

@@ -7,6 +7,8 @@
   "max_loss_per_trade_usd": 50,
   "max_daily_loss_usd": 150,
   "max_trades_per_day": 3,
+  "kill_switch_daily_loss_usd": 10,
+  "kill_switch_losses_in_a_row": 3,
   "max_orders_per_day": 10,
   "min_reward_risk": 1.0,
   "require_stop": true,

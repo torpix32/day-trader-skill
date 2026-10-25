@@ -60,6 +60,8 @@ If `trader/config.json` does not exist, copy `config.example.json` into
 - The day limits trader-risk enforces: **max_daily_loss_usd** (150), **max_trades_per_day** (3),
   **min_reward_risk** (1.0), **require_stop** (always true: false is ignored), **no_entries_before** / **no_entries_after**
   ("09:45" / "15:30") and **flat_by** ("15:55"), all New York time.
+- The kill switch trader-broker enforces: **kill_switch_daily_loss_usd** (10: no new entry for the
+  rest of the day once the trades closed today lost that much) and **kill_switch_losses_in_a_row** (3).
 - **blocked**: tickers they never want to trade.
 - Keep **paper** true until they have watched it work on a paper account.
 
