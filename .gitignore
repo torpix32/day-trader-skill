@@ -1,2 +1,3 @@
 # Runtime data written by the trader-* skills (scans, plans, orders, config)
 trader/
+__pycache__/

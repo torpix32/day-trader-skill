@@ -37,8 +37,9 @@ What blocks an entry (on top):
   duplicate     the same symbol and side twice in this batch, or already
                 placed today (trader/state/broker.json)
   daily limit   max_orders_per_day orders placed today
-  stop          no stop while "require_stop": true (a bracket stop_loss_stop_price
-                or the order's plan stop); a stop on the wrong side of the entry
+  stop          no stop at the broker: every entry needs a bracket
+                stop_loss_stop_price (a stop in the plan only is not enough, and
+                "require_stop": false is ignored); a stop on the wrong side of the entry
   loss          qty x (entry - stop) over max_loss_per_trade_usd. The entry is
                 the limit price for a limit order, else the HIGHER of the plan's
                 entry and a fresh price (under 15 minutes old), so a stale plan
@@ -400,6 +401,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     seen = set()
     results = []
     batch_entries, batch_loss = 0, 0.0
+    if c.get("require_stop", True) is False:
+        top_warn.append("\"require_stop\": false is ignored: every entry needs a stop at the broker")
     if not c.get("paper", True):
         top_warn.append("LIVE account (\"paper\": false): these orders use real money")
     top_warn.extend(win_warns)
@@ -577,16 +580,13 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if leg_stop and plan_stop and abs(leg_stop - plan_stop) > CENT:
                 warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
                              "the broker uses" % (_p(leg_stop), _p(plan_stop)))
-            if stop and not leg_stop:
-                warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
-                             "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
             if not stop:
-                if c.get("require_stop", True):
-                    later.append("stop: no stop. Every entry needs one (\"require_stop\": true): a bracket "
-                                 "stop_loss_stop_price, from trader-exit and trader-budget")
-                else:
-                    warns.append("no stop: the max loss is not capped, so it is not counted in the daily loss")
-            elif ref:
+                later.append("stop: no stop. Every entry needs one at the broker: a bracket "
+                             "stop_loss_stop_price, from trader-exit and trader-budget")
+            elif not leg_stop:
+                later.append("stop: the stop %s is in the plan only, not at the broker. Every entry needs it "
+                             "as a bracket stop_loss_stop_price (trader-budget writes one)" % _p(stop))
+            if stop and ref:
                 if (long and stop >= ref - CENT) or (not long and stop <= ref + CENT):
                     later.append("stop: the stop %s must be %s the entry %s for a %s"
                                  % (_p(stop), "below" if long else "above", _p(ref), side))

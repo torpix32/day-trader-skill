@@ -39,8 +39,18 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git"))
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+        # trader/ is the skills' runtime folder (git-ignored), there once a skill has run
+        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != "trader")
+        self.assertEqual(root, sorted([".claude", ".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+
+    def test_project_skills_are_copies_of_the_root_folders(self):
+        for s in SKILLS:
+            src, dst = os.path.join(ROOT, s), os.path.join(ROOT, ".claude", "skills", s)
+            files = sorted(f for f in os.listdir(src) if f != "__pycache__")
+            self.assertEqual(sorted(f for f in os.listdir(dst) if f != "__pycache__"), files, s)
+            for f in files:
+                with open(os.path.join(src, f), "rb") as a, open(os.path.join(dst, f), "rb") as b:
+                    self.assertEqual(a.read(), b.read(), ".claude/skills/%s/%s differs from %s/%s" % (s, f, s, f))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:

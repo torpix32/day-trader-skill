@@ -68,7 +68,7 @@ batch that is fine order by order but breaks a limit together is caught.
 | size | (entries) under `min_order_usd` or over `max_order_usd` |
 | position | (entries) the stock would be over `max_position_pct` of the account |
 | cash | (entries) the buy would leave less than the cash buffer, or need margin |
-| stop | (entries) no stop while `require_stop` is true (a bracket `stop_loss_stop_price`, or the order's plan stop); a stop on the wrong side of the entry |
+| stop | (entries) no stop at the broker: every entry needs a bracket `stop_loss_stop_price`. A stop in the plan only is not enough, and `"require_stop": false` is ignored. A stop on the wrong side of the entry |
 | loss | (entries) qty x (entry minus stop) over `max_loss_per_trade_usd` |
 | reward:risk | (entries) (target minus entry) / (entry minus stop) under `min_reward_risk` |
 | daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss_usd` |
@@ -99,8 +99,8 @@ How the numbers work:
   `pdt_guard` on if yours does.
 
 Warnings do not block, but say them to the user: a LIVE account, a number
-sent as a number instead of a string, a stop that lives only in the plan and
-not at the broker, a price too old to use, an early close today.
+sent as a number instead of a string, a `"require_stop": false` that is
+ignored, a price too old to use, an early close today.
 
 ## Steps
 

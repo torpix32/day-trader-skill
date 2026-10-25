@@ -19,9 +19,9 @@ TODAY = "2026-10-19"
 V1_TODAY = "2026-10-13"
 PRICES = {"AAPL": 341.27, "AXP": 309.84, "GOOGL": 353.78, "KO": 90.11, "BAC": 53.96}
 QUOTE_TIME = datetime.datetime(2026, 10, 19, 14, 52, 13)   # Yahoo's TSLA quote 366.475, 10:52:13 New York
-# v1's rules with every day-trade check switched off: the long-term checks still hold
+# v1's rules with every day-trade check switched off but the stop (it cannot be): the long-term checks still hold
 V1 = {"budget": 5000, "cash_buffer_pct": 10, "max_position_pct": 25, "max_order_usd": 2000, "min_order_usd": 5,
-      "max_orders_per_day": 10, "require_stop": False, "no_entries_before": None, "no_entries_after": None,
+      "max_orders_per_day": 10, "no_entries_before": None, "no_entries_after": None,
       "max_trades_per_day": 0, "max_daily_loss_usd": 0, "max_loss_per_trade_usd": 0, "min_reward_risk": 0}
 
 
@@ -65,6 +65,21 @@ def buy(sym, usd):
     return {"symbol": sym, "side": "buy", "notional": str(usd), "type": "market", "time_in_force": "day"}
 
 
+def with_stop(o):
+    """The same buy as a limit bracket of the same value: a notional buy becomes 1 share at that price."""
+    o = dict(o)
+    if "notional" in o:
+        price = float(o.pop("notional"))
+        o["qty"] = "1"
+    else:
+        price = float(o.get("limit_price") or PRICES[o["symbol"]])
+    tif = o.get("time_in_force", "day")
+    o.update(type="limit", limit_price="%.2f" % price, time_in_force=tif if tif in ("day", "gtc") else "day",
+             order_class="bracket", stop_loss_stop_price="%.2f" % (price * 0.9),
+             take_profit_limit_price="%.2f" % (price * 1.2))
+    return o
+
+
 def placed(sym, side="buy", day=TODAY, max_loss=46.88, kind=None, status="placed"):
     r = {"symbol": sym, "side": side, "status": status, "date": day, "at": day + "T10:20:00-04:00"}
     if max_loss is not None:
@@ -80,6 +95,11 @@ def verdicts(res):
 
 def reasons(res, i=0):
     return " | ".join(res["results"][i]["reasons"])
+
+
+def only_the_stop(r):
+    """True when the stop is the one reason this order is blocked."""
+    return r["verdict"] == "BLOCK" and all(x.startswith("stop: no stop") for x in r["reasons"])
 
 
 def warnings(res, i=0):
@@ -148,16 +168,17 @@ class DayTradeChecks(unittest.TestCase):
         res = self.one(o)
         self.assertIn("stop: no stop", reasons(res))
         res = self.one(o, require_stop=False, min_reward_risk=0)
-        self.assertEqual(verdicts(res), ["PASS"])
-        self.assertIn("no stop", warnings(res))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("stop: no stop", reasons(res))
+        self.assertIn("\"require_stop\": false is ignored", res["warnings"][0])
 
-    def test_a_plan_stop_counts_but_warns(self):
+    def test_a_plan_stop_is_not_enough(self):
         o = tsla()
         for k in ("order_class", "take_profit_limit_price", "stop_loss_stop_price"):
             o.pop(k)
         res = self.one(o)
-        self.assertEqual(verdicts(res), ["PASS"])
-        self.assertIn("in the plan only", warnings(res))
+        self.assertEqual(verdicts(res), ["BLOCK"])
+        self.assertIn("stop: the stop 358.32 is in the plan only, not at the broker", reasons(res))
         self.assertEqual(res["results"][0]["max_loss"], 46.88)
 
     def test_stop_and_target_on_the_right_side(self):
@@ -295,7 +316,7 @@ class DayTradeChecks(unittest.TestCase):
     def test_extended_hours(self):
         lim = {"symbol": "KO", "side": "buy", "qty": "1", "type": "limit", "limit_price": "90",
                "time_in_force": "gtc", "extended_hours": True}
-        res = check.check([lim], v1(), prices=PRICES, today=V1_TODAY)
+        res = check.check([with_stop(lim)], v1(), prices=PRICES, today=V1_TODAY)
         self.assertEqual(verdicts(res), ["PASS"])
         res = check.check([dict(lim, type="market", limit_price=None)], v1(), prices=PRICES, today=V1_TODAY)
         self.assertIn("extended hours needs a limit order", reasons(res))
@@ -346,20 +367,25 @@ class Exits(unittest.TestCase):
 
 
 class V1Checks(unittest.TestCase):
-    """v1's long-term checks still hold (day-trade checks off)."""
+    """v1's long-term checks still hold (day-trade checks off, the stop always on)."""
 
     def one(self, order, **over):
         return check.check([order], v1(**over), prices=PRICES, today=V1_TODAY)["results"][0]
 
-    def test_the_five_buys_pass_on_a_fresh_5000_paper_account(self):
+    def test_the_five_buys_without_a_stop_are_blocked_by_the_stop_only(self):
         res = check.check(v1_orders(), v1(), today=V1_TODAY)
-        self.assertEqual(verdicts(res), ["PASS"] * 5)
-        self.assertEqual(res["cash_after"], 500)
+        self.assertTrue(all(only_the_stop(r) for r in res["results"]))
         self.assertEqual(res["results"][0]["value_usd"], 1250)
         self.assertEqual(res["results"][0]["amount"], "$1,250")
 
+    def test_the_five_buys_with_a_stop_pass_on_a_fresh_5000_paper_account(self):
+        res = check.check([with_stop(o) for o in v1_orders()], v1(), today=V1_TODAY)
+        self.assertEqual(verdicts(res), ["PASS"] * 5)
+        self.assertEqual(res["cash_after"], 500)
+        self.assertEqual(res["results"][0]["value_usd"], 1250)
+
     def test_a_sixth_buy_is_blocked_three_ways(self):
-        res = check.check(v1_orders() + [buy("AAPL", 100)], v1(), today=V1_TODAY)
+        res = check.check([with_stop(o) for o in v1_orders() + [buy("AAPL", 100)]], v1(), today=V1_TODAY)
         self.assertEqual(verdicts(res), ["PASS"] * 5 + ["BLOCK"])
         why = reasons(res, 5)
         self.assertIn("cash:", why)
@@ -386,7 +412,7 @@ class V1Checks(unittest.TestCase):
         r = self.one(opt)
         self.assertEqual(r["verdict"], "BLOCK")
         self.assertIn("option", " ".join(r["reasons"]))
-        r = self.one(opt, allow_options=True)
+        r = self.one(with_stop(opt), allow_options=True)
         self.assertEqual(r["verdict"], "PASS")
         self.assertTrue(r["warnings"])
 
@@ -406,7 +432,7 @@ class V1Checks(unittest.TestCase):
 
     def test_numbers_should_be_strings(self):
         r = self.one({"symbol": "KO", "side": "buy", "notional": 100, "type": "market", "time_in_force": "day"})
-        self.assertEqual(r["verdict"], "PASS")
+        self.assertTrue(only_the_stop(r))
         self.assertIn("as a string", r["warnings"][0])
 
     def test_share_orders_need_a_price(self):
@@ -414,7 +440,7 @@ class V1Checks(unittest.TestCase):
         self.assertIn("no price for ZZZZ", " ".join(self.one(q)["reasons"]))
         q["symbol"] = "KO"
         r = self.one(q)
-        self.assertEqual(r["verdict"], "PASS")
+        self.assertTrue(only_the_stop(r))
         self.assertAlmostEqual(r["value_usd"], 180.22)
 
     def test_margin(self):
@@ -435,10 +461,10 @@ class V1Checks(unittest.TestCase):
 
     def test_a_sell_frees_cash_for_a_later_buy(self):
         orders = [{"symbol": "KO", "side": "sell", "qty": "5", "type": "market", "time_in_force": "day"},
-                  buy("BAC", 450)]
+                  with_stop(buy("BAC", 450))]
         res = check.check(orders, v1(max_position_pct=100), portfolio=self.PF, prices=PRICES, today=V1_TODAY)
         self.assertEqual(verdicts(res), ["PASS", "PASS"])
-        res = check.check([buy("BAC", 450)], v1(max_position_pct=100), portfolio=self.PF, prices=PRICES,
+        res = check.check([with_stop(buy("BAC", 450))], v1(max_position_pct=100), portfolio=self.PF, prices=PRICES,
                           today=V1_TODAY)
         self.assertEqual(verdicts(res), ["BLOCK"])
 
@@ -447,13 +473,14 @@ class V1Checks(unittest.TestCase):
                          for i in range(10)]}
         res = check.check([buy("KO", 100)], v1(), state=st, today=V1_TODAY)
         self.assertIn("daily limit", reasons(res))
-        res = check.check([buy("KO", 100)], v1(), state=st, today="2026-10-14")
+        res = check.check([with_stop(buy("KO", 100))], v1(), state=st, today="2026-10-14")
         self.assertEqual(verdicts(res), ["PASS"])
         ko = {"orders": [{"symbol": "KO", "side": "buy", "status": "placed", "at": V1_TODAY + "T10:00:00"}]}
         res = check.check([buy("KO", 100)], v1(), state=ko, today=V1_TODAY)
         self.assertIn("already placed today", reasons(res))
         declined = {"orders": [{"symbol": "KO", "side": "buy", "status": "declined", "at": V1_TODAY + "T10:00:00"}]}
-        self.assertEqual(verdicts(check.check([buy("KO", 100)], v1(), state=declined, today=V1_TODAY)), ["PASS"])
+        self.assertEqual(verdicts(check.check([with_stop(buy("KO", 100))], v1(), state=declined, today=V1_TODAY)),
+                         ["PASS"])
 
     def test_live_account_warns(self):
         res = check.check([buy("KO", 100)], v1(paper=False), today=V1_TODAY)
@@ -485,9 +512,12 @@ class Cli(unittest.TestCase):
                 json.dump(v1(), fh)
             none = os.path.join(d, "none")
             out = os.path.join(d, "state", "risk.json")
+            stopped = os.path.join(d, "stopped.json")
+            with open(stopped, "w") as fh:
+                json.dump({"orders": [with_stop(o) for o in v1_orders()]}, fh)
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = check.main(["--orders", V1_ORDERS_PATH, "--config", c, "--portfolio", none, "--prices", none,
+                code = check.main(["--orders", stopped, "--config", c, "--portfolio", none, "--prices", none,
                                    "--state", none, "--today", V1_TODAY, "--out", out])
             self.assertEqual(code, 0)
             self.assertIn("5 passed, 0 blocked", buf.getvalue())

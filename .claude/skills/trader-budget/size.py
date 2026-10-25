@@ -740,8 +740,8 @@ def report(result, orders, source=""):
         amount = ("notional \"%s\"" % o["notional"]) if "notional" in o else ("qty \"%s\"" % o["qty"])
         lines.append("  %s %s %s, %s, %s" % (o["side"], o["symbol"], amount, o["type"], o["time_in_force"]))
     lines.append("")
-    lines.append("These buys have no stop. trader-risk blocks them while \"require_stop\" is true and applies "
-                 "your day-trade limits to every buy.")
+    lines.append("These buys have no stop. trader-risk blocks every entry without a stop at the broker "
+                 "(\"require_stop\" cannot be turned off).")
     lines.append("Next: trader-risk checks every order, then trader-broker asks you yes or no for each one.")
     lines.append("Education and tooling, not financial advice.")
     return "\n".join(lines)
